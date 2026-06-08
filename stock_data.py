@@ -9,6 +9,7 @@ class StockData:
     symbol: str
     from_date: datetime
     to_date: datetime
+    date: list[datetime]
     open: list[float]
     high: list[float]
     low: list[float]
@@ -16,7 +17,7 @@ class StockData:
     adjclose: list[float]
     volume: list[int]
 
-def hist_stock_data_period(start_date, end_date, interval_string, events_string, ticker) -> StockData:
+def hist_stock_data_period(start_date: str, end_date: str, interval_string: str, events_string: str, ticker: str) -> StockData:
     """
     Python equivalent of the MATLAB hist_stock_data_period function.
 
@@ -59,6 +60,7 @@ def hist_stock_data_period(start_date, end_date, interval_string, events_string,
             symbol=ticker,
             from_date=datetime.fromtimestamp(result["timestamp"][0], tz=timezone.utc),
             to_date=datetime.fromtimestamp(result["timestamp"][-1], tz=timezone.utc),
+            date=[datetime.fromtimestamp(ts, tz=timezone.utc) for ts in result["timestamp"]],
             open=indicators["open"],
             high=indicators["high"],
             low=indicators["low"],
