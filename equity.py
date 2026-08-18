@@ -209,15 +209,15 @@ def plot_tobins_separation(W: int, returns: dict[str, utility.Returns], non_SPY_
     plt.show() # type: ignore
     return ts
 
-def compute_portfolio_return(W: int, ts: TobinsSeparation, rate: float= 0.01):
+def compute_portfolio_return(W: int, ts: TobinsSeparation, rate: float= 0.01, required_return: float = 0.15) -> np.ndarray[np.float64, typing.Any]:
     R_pEnd = 1000
     turnover = np.zeros(W, dtype=float)
     allocation = np.zeros((W+1), dtype=float)
-    constant_return = 0.15
+    constant_return = required_return
     plt.figure() # type: ignore
     for i in range(W+1):
         R_pStart = R_pEnd
-        A = (constant_return - rate) / (ts.exp_return[i] - rate)
+        A = min(1.0, (constant_return - rate) / (ts.exp_return[i] - rate))
         allocation[i] = A
         risk = (constant_return - rate) / ts.slope[i]
         x = np.linspace(0.0, 0.9, 100)
@@ -231,6 +231,53 @@ def compute_portfolio_return(W: int, ts: TobinsSeparation, rate: float= 0.01):
     plt.show() # type: ignore
     print("Final portfolio value after", W+1, "windows:", R_pEnd)
     print("Total turnover over all windows:", np.mean(turnover))
+    return allocation
+
+def normalize_weights(weights: np.ndarray[np.float64, typing.Any]) -> np.ndarray[np.float64, typing.Any]:
+    weights_non_zero = weights.copy()
+    weights_non_zero[weights_non_zero < 0] = 0
+    row_sums = np.sum(weights_non_zero)
+    normalized_weights = weights_non_zero / row_sums
+    return normalized_weights
+
+# this function performs a backtest, where lending and borrowing is not allowed
+def backtest(
+    W: int,
+    returns: dict[str, utility.Returns],
+    non_SPY_funds: list[str],
+    ts: TobinsSeparation,
+    allocations: np.ndarray[np.float64, typing.Any],
+    start_year: int,
+    rate: float = 0.01,
+    required_return: float = 0.15,
+):
+    plt.figure() # type: ignore
+    plt.title("Backtest") # type: ignore
+    plt.xlabel("Year") # type: ignore
+    plt.ylabel("Actual yearly return") # type: ignore
+
+    balanced_return = np.zeros(W, dtype=float)
+    optimum_return = np.zeros(W, dtype=float)
+
+    year_returns = np.asarray([returns[fund].yearly for fund in non_SPY_funds], dtype=float)
+
+    for i in range(W):
+        window_returns = year_returns[:, W + i]
+        normalized_weights = normalize_weights(ts.weights[i, :])
+        print(f"Window {i+1} normalized weights: {normalized_weights}")
+        optimum_return[i] = float(normalized_weights @ window_returns)
+        balanced_return[i] = (1 - allocations[i]) * rate + allocations[i] * optimum_return[i]
+
+        plt.scatter(i+1, optimum_return[i], color='red') # type: ignore
+        plt.scatter(i+1, balanced_return[i], color='black') # type: ignore
+
+    plt.plot([0, W + 1], [0.0, 0.0], color='gray', linestyle='--', label='zero return') # type: ignore
+    plt.plot([0, W + 1], [required_return, required_return], color='blue', linestyle='--', label='required return') # type: ignore
+
+    labels = [str(start_year + W + i) for i in range(W)]
+    plt.xticks(np.arange(1, W + 1), labels) # type: ignore
+    plt.legend() # type: ignore
+    plt.show() # type: ignore
 
 def main():
     print("Loading data for the following funds:")
@@ -239,6 +286,7 @@ def main():
     W = 10  # number of windows - 1
     print(funds)
     current_year = 2022
+    required_return = 0.20
     start_year = current_year - W*2
     print("Year range:", start_year, "-", current_year)
     data = load_data(funds, current_year, start_year)
@@ -258,7 +306,9 @@ def main():
         print(f"{fund} average yearly return: {fund_return:.4f}")
     plot_efficient_frontier(W, returns, non_SPY_funds)
     ts = plot_tobins_separation(W, returns, non_SPY_funds)
-    compute_portfolio_return(W, ts, rate=0.01)
+    allocations = compute_portfolio_return(W, ts, rate=0.01, required_return=required_return)
+    backtest(W, returns, non_SPY_funds, ts, allocations,
+             start_year=start_year, rate=0.01, required_return=required_return)
 
 if __name__ == "__main__":
     main()
