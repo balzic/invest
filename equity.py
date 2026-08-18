@@ -1,12 +1,15 @@
 from dataclasses import dataclass
+import sys
 import typing
 
+from long_only import backtest_only_long
 import stock_data as sd
 import math
 import numpy as np
 from matplotlib import pyplot as plt
+from scipy import stats # type: ignore
+from utility import PortfolioResult, compute_covariance_matrix, show_weights
 import utility
-
 
 def log_return(x_vals: list[float], y_vals: list[float]) -> list[float]:
     return [math.log(x / y) for x, y in zip(x_vals, y_vals)]
@@ -146,13 +149,6 @@ def validate_data(data: dict[str, sd.StockData], funds: list[str], current_year:
             print(f"Expected to_date year {current_year - 1}, got {data[fund].to_date.year} for fund {fund}")
             exit(1)
 
-
-def compute_covariance_matrix(returns_matrix: list[list[float]]) -> np.ndarray[np.float64, typing.Any]:
-    returns_np = np.asarray(returns_matrix, dtype=float)
-    # Each row is one asset over time; compute asset-by-asset covariance.
-    covariance_matrix = np.cov(returns_np, rowvar=True)
-    return covariance_matrix
-
 def compute_correlation_matrix(returns_matrix: list[list[float]]) -> np.ndarray[np.float64, typing.Any]:
     returns_np = np.asarray(returns_matrix, dtype=float)
     correlation_matrix = np.corrcoef(returns_np, rowvar=True)
@@ -194,7 +190,7 @@ def plot_tobins_separation(W: int, returns: dict[str, utility.Returns], non_SPY_
         slice_end = i + W
         yearly_returns = [mean(returns[fund].yearly[slice_start:slice_end]) for fund in non_SPY_funds]
         returns_matrix: list[list[float]] = [returns[fund].yearly[slice_start:slice_end] for fund in non_SPY_funds]
-        covariance_matrix = compute_covariance_matrix(returns_matrix)
+        covariance_matrix = utility.compute_covariance_matrix(returns_matrix)
         slope, x, y, exp_return_p, variance_p, weights = efficient_frontier_sbl(covariance_matrix, rate, yearly_returns)
         ts.slope.append(slope)
         ts.exp_return.append(exp_return_p)
@@ -241,6 +237,8 @@ def normalize_weights(weights: np.ndarray[np.float64, typing.Any]) -> np.ndarray
     return normalized_weights
 
 # this function performs a backtest, where lending and borrowing is not allowed
+# to find the return, when borrowing and lending is allowed, simpy remove
+# usage of normalize_weights
 def backtest(
     W: int,
     returns: dict[str, utility.Returns],
@@ -250,6 +248,7 @@ def backtest(
     start_year: int,
     rate: float = 0.01,
     required_return: float = 0.15,
+    normalized: bool = False,
 ):
     plt.figure() # type: ignore
     plt.title("Backtest") # type: ignore
@@ -260,16 +259,27 @@ def backtest(
     optimum_return = np.zeros(W, dtype=float)
 
     year_returns = np.asarray([returns[fund].yearly for fund in non_SPY_funds], dtype=float)
-
+    value_optimum = 1000.0
+    value_balanced = 1000.0
     for i in range(W):
         window_returns = year_returns[:, W + i]
-        normalized_weights = normalize_weights(ts.weights[i, :])
-        print(f"Window {i+1} normalized weights: {normalized_weights}")
+        normalized_weights = ts.weights[i, :]
+        if normalized:
+            normalized_weights = normalize_weights(ts.weights[i, :])
         optimum_return[i] = float(normalized_weights @ window_returns)
+        value_optimum = (1 + optimum_return[i]) * value_optimum
         balanced_return[i] = (1 - allocations[i]) * rate + allocations[i] * optimum_return[i]
+        value_balanced = (1 + balanced_return[i]) * value_balanced
 
         plt.scatter(i+1, optimum_return[i], color='red') # type: ignore
         plt.scatter(i+1, balanced_return[i], color='black') # type: ignore
+    output_optimum = "normalized " if normalized else ""
+    print(f"{output_optimum}optimum portfolio after", W, "windows:", value_optimum)
+    print(f"{output_optimum}balanced portfolio after", W, "windows:", value_balanced)
+    if normalized:
+        show_weights(normalize_weights(ts.weights[W, :]), non_SPY_funds, normalized=True)
+    else:
+        show_weights(ts.weights[W, :], non_SPY_funds)
 
     plt.plot([0, W + 1], [0.0, 0.0], color='gray', linestyle='--', label='zero return') # type: ignore
     plt.plot([0, W + 1], [required_return, required_return], color='blue', linestyle='--', label='required return') # type: ignore
@@ -278,15 +288,100 @@ def backtest(
     plt.xticks(np.arange(1, W + 1), labels) # type: ignore
     plt.legend() # type: ignore
     plt.show() # type: ignore
+    return PortfolioResult(balanced_return=balanced_return, optimum_return=optimum_return)
+
+
+@dataclass
+class SingleIndexModelResult:
+    beta: float
+    alpha: float
+    sigma2_e: float
+    alpha_p: float
+    beta_p: float
+    r2: float
+
+
+# Compute single index model for a single stock
+# stock_returns: [N] stock returns
+# market_returns: [N] market returns
+def single_index_model(
+    stock_returns: typing.Union[np.ndarray[np.float64, typing.Any], list[float]],
+    market_returns: typing.Union[np.ndarray[np.float64, typing.Any], list[float]],
+) -> SingleIndexModelResult:
+    s = np.asarray(stock_returns, dtype=float)
+    m = np.asarray(market_returns, dtype=float)
+    if s.size != m.size:
+        raise ValueError(f"Stock returns length {s.size} must match market returns length {m.size}.")
+    n = s.size
+    market_return = float(np.mean(m))
+    stock_return = float(np.mean(s))
+    diff_m = m - market_return
+    diff_s = s - stock_return
+    sigma_sm = float(diff_s @ diff_m)
+    sigma_m = float(diff_m @ diff_m)
+    beta = sigma_sm / sigma_m
+    alpha = stock_return - beta * market_return
+    diff_prediction = s - (alpha + beta * m)
+    sigma2_e = float(diff_prediction @ diff_prediction) / n
+    error = float(diff_prediction @ diff_prediction) / (n - 2)
+    devterm = 1.0 / n + market_return * market_return / sigma_m
+    std_err_alpha = math.sqrt(error) * math.sqrt(devterm)
+    std_err_beta = math.sqrt(error) / math.sqrt(sigma_m)
+    alpha_p = 2.0 * float(stats.t.pdf(alpha / std_err_alpha, n - 2)) # type: ignore
+    beta_p = 2.0 * float(stats.t.pdf(beta / std_err_beta, n - 2)) # type: ignore
+    r2 = beta * math.sqrt(sigma_m) / math.sqrt(float(diff_s @ diff_s))
+    return SingleIndexModelResult(beta=beta, alpha=alpha, sigma2_e=sigma2_e, alpha_p=alpha_p, beta_p=beta_p, r2=r2)
+
+
+def security_market_line(
+    W: int,
+    portfolio: utility.PortfolioResult,
+    year_market: list[float],
+    returns: dict[str, utility.Returns],
+    non_SPY_funds: list[str],
+    rate: float = 0.01,
+):
+    plt.figure() # type: ignore
+    plt.title("Comparison to Security Market Line of CAPM") # type: ignore
+    plt.xlabel("Beta") # type: ignore
+    plt.ylabel("Expected return") # type: ignore
+
+    market_returns = year_market[W:2 * W]
+    market_slope = mean([r - rate for r in market_returns])
+
+    beta_plot = np.linspace(0.0, 2.0, 100)
+    plt.plot(beta_plot, rate + market_slope * beta_plot) # type: ignore
+
+    for name, portfolio_returns in (("Balanced portfolio", portfolio.balanced_return),
+                                    ("Optimum portfolio", portfolio.optimum_return)):
+        sim = single_index_model(portfolio_returns, market_returns)
+        print(f"({name})")
+        print("Jensens alpha:", sim.alpha - rate)
+        print("The P values for Alpha:", sim.alpha_p)
+        print("The P values for Beta:", sim.beta_p)
+        print("The goodness of fit R2:", sim.r2)
+        plt.scatter(sim.beta, float(np.mean(portfolio_returns)), s=100, marker='d', label=name) # type: ignore
+
+    for fund in non_SPY_funds:
+        fund_returns = returns[fund].yearly[W:2 * W]
+        sim = single_index_model(fund_returns, market_returns)
+        plt.scatter(sim.beta, mean(fund_returns)) # type: ignore
+        plt.text(sim.beta, mean(fund_returns), fund) # type: ignore
+
+    plt.legend() # type: ignore
+    plt.show() # type: ignore
 
 def main():
+    arg = ""
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
     print("Loading data for the following funds:")
-    funds = ['SPY', 'FOCPX', 'DIA', 'XLY', 'XLF', 'XLK', 'IWM', 'XLE']
+    funds = ['SPY', 'FOCPX', 'DIA', 'XLY', 'XLK']
     #N = len(funds)
     W = 10  # number of windows - 1
     print(funds)
-    current_year = 2022
-    required_return = 0.20
+    current_year = 2026
+    required_return = 0.15
     start_year = current_year - W*2
     print("Year range:", start_year, "-", current_year)
     data = load_data(funds, current_year, start_year)
@@ -307,8 +402,20 @@ def main():
     plot_efficient_frontier(W, returns, non_SPY_funds)
     ts = plot_tobins_separation(W, returns, non_SPY_funds)
     allocations = compute_portfolio_return(W, ts, rate=0.01, required_return=required_return)
-    backtest(W, returns, non_SPY_funds, ts, allocations,
+    if arg == "long-only":
+        print("Running backtest with long-only portfolios...")
+        portfolioResult = backtest_only_long(W, returns, non_SPY_funds, allocations,
              start_year=start_year, rate=0.01, required_return=required_return)
+        security_market_line(W, portfolioResult, year_market, returns, non_SPY_funds, rate=0.01)
+    elif arg == "normalize":
+        print("Running backtest with normalized portfolios...")
+        portfolioResult = backtest(W, returns, non_SPY_funds, ts, allocations,
+             start_year=start_year, rate=0.01, required_return=required_return, normalized=True)
+        security_market_line(W, portfolioResult, year_market, returns, non_SPY_funds, rate=0.01)
+    else:
+        portfolioResult = backtest(W, returns, non_SPY_funds, ts, allocations,
+             start_year=start_year, rate=0.01, required_return=required_return)
+        security_market_line(W, portfolioResult, year_market, returns, non_SPY_funds, rate=0.01)
 
 if __name__ == "__main__":
     main()
